@@ -5,7 +5,7 @@ Reference from
 
 - https://github.com/f-fathurrahman/PWDFT.jl
 - https://github.com/JuliaMolSim/DFTK.jl
-- https://github.com/dcccc/Plane\_Wave\_DFT
+- https://github.com/dcccc/Plane_Wave_DFT
 
 
 Papers:
