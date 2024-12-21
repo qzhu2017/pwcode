@@ -7,11 +7,12 @@ class Structure:
     def __init__(self, lattice, positions):
         self.lattice = lattice
         self.rec_lattice = 2 * np.pi * np.linalg.inv(lattice)
-        self.positions = positions
+        self.frac_positions = positions
+        self.cart_positions = positions @ lattice
         self.volume = np.abs(np.linalg.det(lattice))
 
     def __str__(self):
-        strs = "System Setup\n"
+        strs = "\nSystem Setup\n"
         strs += f"Model volume: {self.volume:.4f}\n"
         strs += "Model lattice (Bohr):\n"
         for r in self.lattice:
@@ -19,12 +20,14 @@ class Structure:
         strs += "Model rec.lat (Bohr^-1):\n"
         for r in self.rec_lattice:
             strs += " ".join(f"{x:12.6f}" for x in r) + "\n"
-        strs += "Model coordinates:\n"
-        for r in self.positions:
+        strs += "Model coordinates (frac):\n"
+        for r in self.frac_positions:
+            strs += " ".join(f"{x:12.6f}" for x in r) + "\n"
+        strs += "Model coordinates (cart):\n"
+        for r in self.cart_positions:
             strs += " ".join(f"{x:12.6f}" for x in r) + "\n"
         return strs
 
-    
 class PlaneWaveBasis:
     def __init__(self, model, Ecut, kpoints, kweights):
         """
@@ -35,11 +38,12 @@ class PlaneWaveBasis:
             kweights: array, The weights of the k-points.
         """
         # System input
-        self.Ecut = Ecut
+        self.Ecutwfc = Ecut
+        self.Ecutrho = 4 * Ecut
         self.model = model
 
         # FFT and G_vector setup
-        Gmax = 2 * np.sqrt(2 * self.Ecut)
+        Gmax = 2 * np.sqrt(2 * self.Ecutwfc)
         inv_lat_t = np.linalg.inv(self.model.rec_lattice.T)
         norm = np.ceil(np.linalg.norm(inv_lat_t, axis=1) * Gmax)
         self.fx = int(norm[0])
@@ -49,34 +53,65 @@ class PlaneWaveBasis:
         self.grid_point = 2 * grid_point + 1
         self.num_grids = np.prod(self.grid_point)
         self.get_g_vectors()
+        self.max_g2 = (self.g_rhos ** 2).sum(axis=1).max()
+        self.max_g2w = (self.g_wfcs ** 2).sum(axis=1).max()
         
         # Kpoints
-        self.kpoints = kpoints
+        self.kpoints = kpoints @ self.model.rec_lattice
         self.kweights = kweights
 
     def __str__(self):
-        strs = "Planewave Setup\n"
-        strs += f"Cutoff Energy (Ry):       {self.Ecut}\n"
-        strs += f"FFT Grid Size:            {self.grid_point}\n"
-        strs += f"Number of used g vectors: {len(self.gs)}\n"
+        strs = "\nPlanewave Setup\n"
+        strs += f"Cutoff Energy in planewave (Ry): {self.Ecutwfc}\n"
+        strs += f"Cutoff Energy in density (Ry):   {self.Ecutrho}\n"
+        strs += f"FFT Grid Size:                   {self.grid_point}\n"
+        strs += f"Num g vectors in density:        {len(self.g_wfcs)}\n"
+        strs += f"Max g2 vectors in density:       {self.max_g2}\n"
+        strs += f"Num g vectors in planewave:      {len(self.g_rhos)}\n"
+        strs += f"Max g2 vectors in planwwave:     {self.max_g2w}\n"
+        strs += f"Num kpoints used:                {len(self.kpoints)}\n"
+        for kpt, kw in zip(self.kpoints, self.kweights):
+            strs += " ".join(f"{x:12.6f}" for x in kpt) 
+            strs += f"   weight: {kw:12.6f}\n"
+ 
         return strs
 
     def get_g_vectors(self):
         """
         Compute g-vectors and 3D masks for the FFT grid.
+        Note we have two cutoff values for electron density 
+        and planewave expansions
         """
-        Gs = []
-        masks = np.zeros(self.grid_point)
+        g_rhos = [] 
+        g_wfcs = []
+        g_masks_r = np.zeros(self.grid_point, dtype=int)
+        g_masks_w = np.zeros(self.grid_point, dtype=int)
 
-        for h in range(-self.fx, self.fx):
-            for k in range(-self.fy, self.fy):
-                for l in range(-self.fz, self.fz):
-                    g = np.array([h, k, l]) @ self.model.rec_lattice
-                    if np.sum(g**2) <= 2*self.Ecut:
-                        Gs.append(g)
-                        masks[h+self.fx, k+self.fy, l+self.fz] = 1 
-        self.gs = np.array(Gs)
-        self.masks = masks.astype(bool)
+        #for h in range(-self.fx, self.fx):
+        #    for k in range(-self.fy, self.fy):
+        #        for l in range(-self.fz, self.fz):
+        for i in range(self.grid_point[0]):
+            ii = i-self.grid_point[0]  if i > self.grid_point[0] // 2 else i
+            for j in range(self.grid_point[1]):
+                jj = j-self.grid_point[1] if j > self.grid_point[1] // 2 else j
+                for k in range(self.grid_point[2]):
+                    kk = k-self.grid_point[0]  if k > self.grid_point[2] // 2 else k
+                    g = np.array([ii, jj, kk]) @ self.model.rec_lattice
+                    g2 = np.sum(g**2)
+                    if g2 <= 2*self.Ecutrho:
+                        g_rhos.append(g)
+                        g_masks_r[i, j, k] = 1 
+                        if g2 <= 2*self.Ecutwfc:
+                            g_wfcs.append(g)
+                            g_masks_w[i, j, k] = 1
+
+        self.g_rhos = np.array(g_rhos)
+        self.g_wfcs = np.array(g_wfcs)
+        self.g_masks_r = g_masks_r.astype(bool)
+        self.g_masks_w = g_masks_w.astype(bool)
+        #print(self.g_rhos[0], self.g_masks_r[0, 0, 0])
+        #print(self.g_rhos[-1],self.g_masks_r[-1, -1, -1])
+        #print("g_masks", g_masks_r.shape, self.g_masks_r.flatten()[:10]); import sys; sys.exit()
 
     def orthonormalize(self, psi):
         """
@@ -89,16 +124,19 @@ class PlaneWaveBasis:
         """
         Random guess of wavefunction given the number of occupied states
         """
-        num_gs = len(self.gs)
+        num_gs = len(self.g_wfcs)
+        num_ks = len(self.kweights)
         real_part = np.random.rand(num_states, num_gs) 
         imag_part = np.random.rand(num_states, num_gs) 
         psi = real_part + 1j * imag_part
         psi = self.orthonormalize(psi)
 
         [fx, fy, fz] = self.grid_point
-        psi_3d = np.zeros([num_states, fx, fy, fz], dtype=complex)
-        for i in range(num_states):
-            psi_3d[i, self.masks] += psi[i] 
+        psi_3d = np.zeros([num_ks, num_states, fx, fy, fz], 
+                          dtype=complex)
+        for k in range(num_ks):
+            for i in range(num_states):
+                psi_3d[k, i, self.g_masks_w] += psi[i] 
 
         return psi_3d
 
@@ -111,7 +149,7 @@ class PlaneWaveBasis:
             occs [num_kpts]
         """
         occs = np.array(occs)
-        num_gs = len(self.gs)
+        num_gs = len(self.g_wfcs)
         vol = self.model.volume
         rho = np.zeros(self.grid_point) 
 
@@ -151,6 +189,7 @@ class PspHgh:
     """
 
     def __init__(self, Z, rloc, cloc, rp, h):
+        self.name = "Si"
         self.Z = Z
         self.rloc = rloc
         if len(cloc) < 4:
@@ -158,12 +197,34 @@ class PspHgh:
         else:
             self.cloc = cloc
         self.lmax = len(h) - 1
+        self.proj = ['s', 'p', 'd', 'f'][:len(h)]
         self.rp = rp
         self.h = h
 
+    def __str__(self):
+        strs = "\nPseudopotential Setup\n"
+        strs += f"Element:                  {self.name}\n"
+        strs += f"Number of electrons:      {self.Z}\n"
+        strs += f"local radius:             {self.rloc:.6f}\n"
+        strs += f"local coefficients:   "
+        for cloc in self.cloc:
+            if abs(cloc) > 0:
+                strs += f"{cloc:12.6f}"
+            else:
+                strs += "\n"
+                break
+        for l in range(self.lmax+1):
+            proj, rp, h = self.proj[l], self.rp[l], self.h[l]
+            strs += f"Nonlocal Projector {proj}: {rp:12.6f}\n"
+            strs += f"Coupling matrix\n"
+            for c in h:
+                strs += "                      "
+                strs += " ".join(f"{x:12.6f}" for x in c) + "\n"
+        return strs
+
     def eval_v_local_r(self, r):
         """
-        Evaluate the local pseudopotential in real space, eq. (12.5)
+        Evaluate the local pseudopotential in real space, eq. (12.3)
         """
         cloc = self.cloc
         rr = r / self.rloc
@@ -171,26 +232,62 @@ class PspHgh:
                 + np.exp(-rr**2 / 2) * (cloc[0] + 
                 cloc[1] * rr**2 + cloc[2] * rr**4 + cloc[3] * rr**6))
     
-    def eval_v_local_g(self, g2):
+    def eval_v_local_g(self, g):
         """
-        Compute the local pseudopotential polynomial, eq. (12.2)
+        Compute the local pseudopotential polynomial, eq. (12.6)
         """
+        g = np.array(g)
+        g2 = (g ** 2).sum()
         if g2 == 0:
             return 0
+
         rloc = self.rloc
-        gr_loc2 = g2 * (r_loc ** 2)
+        x2 = g2 * (rloc ** 2)
         Z = self.Z
-        exp = np.exp(-0.5 * gr_loc2)
+
+        exp = np.exp(-0.5 * x2)
         term1 = -4 * np.pi * Z / g2 * exp
 
         P = (self.cloc[0]
-             + self.cloc[1] * (3 - t**2)
-             + self.cloc[2] * (15 - 10 * t**2 + t**4)
-             + self.cloc[3] * (105 - 105 * t**2 + 21 * t**4 - t**6))
+             + self.cloc[1] * (3. - x2)
+             + self.cloc[2] * (15. - 10. * x2 + x2**2)
+             + self.cloc[3] * (105. - 105. * x2 + 21. * x2**2 - x2**3))
         term2 = np.sqrt(8 * np.pi **3) * rloc ** 3 * exp * P
 
         return term1 + term2
- 
+
+    def get_v_loc_r(self, pw):
+        """
+        Compute the local V_ps for the given structure
+
+        Args:
+            pw: planewave instance
+
+        """
+        grid_point = pw.grid_point
+        vol = pw.model.volume
+        g_masks = pw.g_masks_r
+        g_vectors = pw.g_rhos
+        v_loc_g = np.zeros(grid_point, dtype=complex)
+
+        # Get the sum of v_loc_g
+        pos = (pw.model.cart_positions).T
+        sf = np.exp(1j*g_vectors @ pos).sum(axis=1)
+        v_loc_g_1D = np.zeros(len(g_vectors), dtype=complex)
+        for i, g in enumerate(g_vectors):
+            v_loc_g_1D[i] = self.eval_v_local_g(g)
+        v_loc_g[g_masks] = v_loc_g_1D#; print(v_loc_g.flatten()[:5])
+        v_loc_g_1D *= sf / vol
+
+        # convert to 3D
+        v_loc_g[g_masks] = v_loc_g_1D
+        #print(v_loc_g.flatten()[:5], g_masks.flatten()[:5])
+        v_loc_r = np.zeros(grid_point, dtype=complex)
+        v_loc_r = np.fft.ifftn(v_loc_g) * np.prod(grid_point)
+        return v_loc_r
+
+
+
     def eval_v_nonlocal_g(self, i, l):
         """
         Compute the projector polynomial, eq. (12.4)
@@ -223,26 +320,6 @@ class PspHgh:
             return common * 2 / 3 / np.sqrt(105) * t**2 * (7 - t**2)
         if l == 3 and i == 1:
             return common * t**3 / np.sqrt(105)
-
-    def get_v_loc_r(self, pw):
-        grid_point = pw.grid_point
-        vol = pw.model.volume
-        g_vector_mask = pw.g_vector_mask
-        v_loc_r = np.zeros(grid_point, dtype=np.complex128)
-        v_loc_g = np.zeros(grid_point, dtype=np.complex128)
-
-        # Sum over all grid point
-        for i in range(grid_point[0]):
-            for j in range(grid_point[1]):
-                for k in range(grid_point[2]):
-                    if pw.masks[i, j, k]:
-                        g2 = np.sum(pw.g_vector[i, j, k] ** 2)
-                        v_loc_g[i, j, k] = self.eval_v_loc_g(g2)
-        # v_loc_g * sf
-        v_loc_g *= sf / vol
-        # FFT from g to r
-        v_loc_r = np.fft.ifftn(v_loc_g) * np.prod(grid_point)
-        return v_loc_r
 
     def get_v_nloc(self, psi_g, pw):
         #grid_point = pw.grid_point
@@ -281,32 +358,40 @@ class PspHgh:
 if __name__ == "__main__":
 
     np.random.seed(42)
-    lattice = 5.23 * np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+    lattice = 5.13155 * np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
     positions = np.array([[0, 0, 0], [0.25, 0.25, 0.25]])
     model = Structure(lattice, positions)
     print(model)
 
     pw = PlaneWaveBasis(model, 
                         Ecut=15.0, 
-                        kpoints=np.array([0, 0, 0]), 
-                        kweights=np.array([1.0]))
+                        kpoints=np.array([[0, 0, 0],
+                                          [0.25, 0.25, 0.25],
+                                          [0, 0.5, 0],
+                                          [0.5, 0, 0.5],
+                                          ]), 
+                        kweights=np.array([1., 6., 8., 12.])/27.
+                        )
     print(pw)
     psi_g_3d = pw.random_guess(5)
-    rho = pw.compute_density([psi_g_3d], [1, 1, 1, 1, 0]).sum()
+    rho = pw.compute_density(psi_g_3d, [1, 1, 1, 1, 0]).sum()
     rho *= pw.model.volume/pw.num_grids
     print(f"Initial wavefunction:     {psi_g_3d.shape}")
     print(f"Number of electrons:      {rho}")
 
-    print("\nPseudopotential")
-    psp = PspHgh(Z=4, rloc=np.array([0.44000000]), 
+    psp = PspHgh(Z=4, rloc=0.44000000, 
                  cloc=np.array([-7.33610297, 0, 0, 0]), 
                  rp=np.array([0.42273813, 0.48427842]), 
                  h=np.array([[[5.90692831, -1.26189397],
                               [0.00000000, 3.25819622]],
                              [[2.72701346, 0.00000000],
                               [0.00000000, 0.00000000]]]))
-    print("v_local    real", psp.v_local_r(1))
-    print("v_nonlocal real", psp.v_nonlocal_r(1, 1, 1))
+    print(psp)
+    print("v_local_g", psp.eval_v_local_r(1))
+    v_loc_r = psp.get_v_loc_r(pw)
+    print("v_local_r", v_loc_r.flatten()[:10])
+    #g = [1, 0, 0]
+    #print(f"v_nonlocal real (g={g})", psp.eval_v_local_g(g))
 
 
 #def Hamiltonian:
