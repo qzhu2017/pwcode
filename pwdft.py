@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.special import erf, gamma, sph_harm
-
 from scipy import linalg
 from scipy.fft import fftn, ifftn
 
@@ -158,17 +157,22 @@ class PlaneWaveBasis:
         """
         get psi in 3d grids format
         """
-        [gx, gy, gz] = self.grids
         n_kpts = self.n_kpts
         psi_3d = [[] for _ in range(n_kpts)]
         for ik in range(n_kpts):
-            n_states = len(self.psi_1d[ik])
-            mask = self.g_masks_w[ik]
-            psi_3d[ik] = np.zeros([n_states, gx, gy, gz],
-                                   dtype=complex)
-            for i in range(n_states):
-                psi_3d[ik][i][mask] += self.psi_1d[ik][i] 
+            psi_3d[ik] = self.get_psi_3d_single(self.psi_1d[ik], ik)
         self.psi_3d = psi_3d
+        return psi_3d
+
+    def get_psi_3d_single(self, psi_1d, ik):
+        [gx, gy, gz] = self.grids
+        mask = self.g_masks_w[ik]
+        ns = len(psi_1d)
+
+        psi_3d_k = np.zeros([ns, gx, gy, gz], dtype=complex)
+        for i in range(ns):
+            psi_3d_k[i][mask] += psi_1d[i] 
+        return psi_3d_k
 
     def get_rho_r(self):
         """
@@ -187,6 +191,16 @@ class PlaneWaveBasis:
                 rho_r *= 2 * occ * kw * self.num_grids / vol
                 rho += rho_r
         self.rho_r = rho
+
+    def precondition_KE(self, psi, ik):
+        """
+        Simple preconditioner based on kinetic energy
+        """
+        ns = len(psi[0])
+        gs = self.g_wfcs[ik][:ns] + self.kpoints[ik]
+        g2s = (gs**2).sum(axis=1)
+        psi /= (1.0 + g2s)
+        return psi
 
 class PspHgh:
     """
@@ -281,12 +295,13 @@ class PspHgh:
              + self.cloc[3] * (105. - 105. * x2 + 21. * x2**2 - x2**3))
         term2 = np.sqrt(8.0 * np.pi **3) * rloc ** 3 * exp * P
         V[ids] = term1 + term2
-
-        term0 =  (2 * np.pi)**1.5 * rloc**3 * (self.cloc[0] +
-                 3.0 * self.cloc[1] + 
-                 15.0 * self.cloc[2] + 
-                 105. * self.cloc[3])
-        V[ids0] = 2 * np.pi * Z * rloc**2 + term0
+        
+        if True: #False:
+            term0 =  (2 * np.pi)**1.5 * rloc**3 * (self.cloc[0] +
+                     3.0 * self.cloc[1] + 
+                     15.0 * self.cloc[2] + 
+                     105. * self.cloc[3])
+            V[ids0] = 2 * np.pi * Z * rloc**2 + term0
 
         return V 
 
@@ -361,6 +376,7 @@ class PspHgh:
             pw: planewave instance
         """
         grids = pw.grids
+        n_grids = pw.num_grids
         vol = pw.model.volume
         g_masks = pw.g_masks_r
         g_vectors = pw.g_rhos
@@ -377,32 +393,32 @@ class PspHgh:
 
         # fft to real space
         v_loc_r = np.zeros(grids, dtype=complex)
-        v_loc_r = np.fft.ifftn(v_loc_g) * np.prod(grids)
+        v_loc_r = np.fft.ifftn(v_loc_g) * n_grids
         self.v_loc_r = v_loc_r
 
-    def get_v_nloc(self, pw):
+    def get_v_nloc(self, pw, psi=None, ik=0):
 
-        V = [[] for _ in range(pw.n_kpts)]
-
-        for ik in range(pw.n_kpts):
-            # h[i,j] * beta * < beta^* | psi>
-            n_ilms = len(self.ilm_indices)
+        if psi is None:
             psi = pw.psi_1d[ik] # (N_states, Ngx)
-            beta = self.beta_nl[ik] # (N_ilm, Ngx, Natoms)
-            # <beta|psi> => (N_ilm, Nat, Nst)
-            # (N_ilm, Ngx, Nat) (Nst, Ngx) 
-            out = np.einsum('ijk,lj->ikl', beta, psi).conj() 
-            #out = np.einsum('ijk,lj->ikl', beta, psi)
 
-            V[ik] = np.zeros(psi.shape, dtype=complex)
-            for idx1 in range(n_ilms):
-                (i1, l1, m1) = self.ilm_indices[idx1]
-                for idx2 in range(n_ilms):
-                    (i2, l2, m2) = self.ilm_indices[idx2]
-                    if [l1, m1] == [l2, m2]:
-                        coef = self.h[l1][i1-1, i2-1]
-                        tmp2 = np.einsum('ij,jk->ki', beta[idx1], out[idx2])
-                        V[ik] += coef * tmp2.conj() 
+        V = np.zeros(psi.shape, dtype=complex)
+
+        # h[i,j] * beta * < beta^* | psi>
+        n_ilms = len(self.ilm_indices)
+        beta = self.beta_nl[ik] # (N_ilm, Ngx, Natoms)
+        # <beta|psi> => (N_ilm, Nat, Nst)
+        # (N_ilm, Ngx, Nat) (Nst, Ngx) 
+        out = np.einsum('ijk,lj->ikl', beta, psi).conj() 
+        #out = np.einsum('ijk,lj->ikl', beta, psi)
+
+        for id1 in range(n_ilms):
+            (i1, l1, m1) = self.ilm_indices[id1]
+            for id2 in range(n_ilms):
+                (i2, l2, m2) = self.ilm_indices[id2]
+                if [l1, m1] == [l2, m2]:
+                    coef = self.h[l1][i1-1, i2-1]
+                    tmp2 = np.einsum('ij,jk->ki', beta[id1], out[id2])
+                    V += coef * tmp2.conj() 
         #for i in range(len(V)): print("V_nloc", V[i, 0], psi[i, 0])
         return V
 
@@ -461,7 +477,7 @@ class Hamiltionian:
         self.V_ps_loc = psp.v_loc_r
         self.V_Hartree = np.zeros(pw.grids)
         self.V_XC = np.zeros(pw.grids)
-        self.V_total = np.zeros(pw.grids)
+        self.V_total = None #np.zeros(pw.grids)
 
         # energies
         self.E_Kinetic = 0
@@ -490,62 +506,71 @@ class Hamiltionian:
         self.E_Kinetic = self.get_E_Kinetic()
         self.E_total = self.E_ps_loc + self.E_XC + self.E_Hartree
         self.E_total += self.E_ps_nloc + self.E_Kinetic + self.E_NN
+        return self.E_total
 
-    def get_H_op(self, verbose=False):
+    def get_H_op(self, ik=0, psi=None, verbose=False):
+    
+        if psi is None: psi = self.pw.psi_1d[ik]
 
-        ns = len(self.pw.psi_3d[0])
-        # Update kinetic operator
-        self.get_K_op()
+        ns = len(psi)
+        ngs = len(psi[0])
+        mask = self.pw.g_masks_w[ik]
 
         # Update local potential
-        self.get_V_XC()
-        self.get_V_Hartree()
-        V = self.V_ps_loc.real + self.V_XC + self.V_Hartree
-        self.V_total = V
+        if self.V_total is None:
+            V_XC = self.get_V_XC()
+            V_H = self.get_V_Hartree()
+            self.V_XC = V_XC
+            self.V_Hartree = V_H
+            self.V_total = self.V_ps_loc.real + V_XC + V_H
+        V = self.V_total
+
+        # local: V(r) => V(g)
+        Vg = np.zeros([ns, ngs], dtype=complex)
+        psi_3d = self.pw.get_psi_3d_single(psi, ik)
+        for i, _psi in enumerate(psi_3d):
+            psi_r = np.fft.ifftn(_psi)
+            Vg[i] += np.fft.fftn(V * psi_r)[mask]
+
+        # Update kinetic operator
+        T = self.get_K_op(psi, ik)
 
         # Update nonlocal potential
-        self.V_ps_nloc = self.psp.get_v_nloc(self.pw)
+        V_ps_nloc = self.psp.get_v_nloc(self.pw, psi, ik)
 
         # Get the H
-        self.H = [[] for _ in range(self.pw.n_kpts)]
-        for ik in range(self.pw.n_kpts):
-            # local: V(r) => V(g)
-            mask = self.pw.g_masks_w[ik]
-            num_gs = len(self.pw.psi_1d[ik][0])
-            Vg = np.zeros([ns, num_gs], dtype=complex)
-            for i, psi in enumerate(self.pw.psi_3d[ik]):
-                psi_r = np.fft.ifftn(psi)
-                Vg[i] += np.fft.fftn(V * psi_r)[mask]
-
-            self.H[ik] = self.T[ik] + Vg + self.V_ps_nloc[ik] 
+        H = T + Vg + V_ps_nloc
 
         if verbose:
-            print("debug Kinetic", self.T[0][0].real.flatten()[:5])
+            print("debug psi", psi.real.flatten()[:5])
+            print("debug Kinetic", T.real.flatten()[:5], T.sum())
             print("debug V_XC", self.V_XC.flatten()[:5], self.V_XC.sum())
             print("debug V_Hartree", self.V_Hartree.flatten()[:5], self.V_Hartree.sum())
             print("debug V_ps_loc", self.V_ps_loc.flatten().real[:5], self.V_ps_loc.sum())
-            print("debug V_total", self.V_total.flatten().real[:5], V.sum())
-            print("debug V_ps_nloc", self.V_ps_nloc[0][0].flatten()[:5])
-            print('op_H', self.H[0][0].flatten()[:5].real)
+            print("debug V_ps_loc", self.V_ps_loc.flatten().real[-5:])
+            print("debug V_total", V.flatten().real[:5], V.sum())
+            print("debug V_ps_nloc", V_ps_nloc[0].flatten()[:5])
+            for i in range(ns):
+                print('op_H', H[i].flatten()[:5].real)
+
+        return H
 
 
-    def get_K_op(self):
+    def get_K_op(self, psi_1d, ik):
         """
         get kinetic operator in 1D g space
         """
-        T = [[] for _ in range(self.pw.n_kpts)]
-        for ik in range(self.pw.n_kpts):
-            k = self.pw.kpoints[ik]
-            gs = self.pw.g_wfcs[ik]
-            g2s = np.sum((gs + k)**2, axis=1)
-            T[ik] = 0.5 * (g2s * self.pw.psi_1d[ik])
-        self.T = T
+        k = self.pw.kpoints[ik]
+        gs = self.pw.g_wfcs[ik]
+        g2s = np.sum((gs + k)**2, axis=1)
+        T = 0.5 * (g2s * psi_1d)
+        return T
 
     def get_V_XC(self):
         """
         get V_xc in 3d real space
         """
-        self.V_XC = -0.5 * np.cbrt(3. * self.pw.rho_r / np.pi)
+        return -0.5 * np.cbrt(3. * self.pw.rho_r / np.pi)
     
     def get_V_Hartree(self):
         """
@@ -560,90 +585,128 @@ class Hamiltionian:
 
         # Reset the gamma to 0
         V_g[0, 0, 0] = 0
-        self.V_Hartree = np.real(np.fft.ifftn(V_g))
+        #self.V_Hartree = np.real(np.fft.ifftn(V_g))
+        return np.real(np.fft.ifftn(V_g))
 
-    def diag_davidson(self):
-        
-        ns = len(self.pw.psi_3d[0])
-        self.get_op_H()
-        for ik in range(self.pw.n_kpts):
-            psi, H = self.pw.psi_1d[ik], self.H[ik]
+    def diag(self, ik=0):
+        """
+        Davidson dialgonalization
+        """
+        ns = len(self.pw.psi_1d[0])
+        psi = self.pw.psi_1d[ik]
+        H = self.get_H_op(ik)#, verbose=True)
 
-            # Initial eigenvalues
-            eigval0 = (H * psi.conj()).sum(axis=1).real
-            print('eigval', ik, eigval0)
+        # Initial guess eigenvalues
+        eigval0 = (H * psi.conj()).sum(axis=1).real
+        #print("1st psi", psi.flatten()[:5])
+        #print("1st H", H.flatten()[:5], H.sum())
+        #print('eigval', ik, eigval0)
 
-            # residuals
-            R = eigval0[:, None] * psi - H  # (ns, ngs)
+        # residuals
+        R = eigval0[:, None] * psi - H  # (ns, ngs)
+        residual = np.sqrt(np.einsum('ij,ij->i', R, R.conj()).real)
+        #print('RRRRRR', R.flatten()[:5])
+        #print('res', residual)
+
+        for i in range(50):
+            res_norm = 1.0 /residual
+            R *= res_norm[:, None] 
+            R = self.pw.precondition_KE(R, ik)
+            #R = R / (1 + (self.pw.g_wfcs[ik]**2).sum(axis=1))
+
+            # H in the subspace, check====
+            #print('res_norm', res_norm)
+            #print('precondiction', R.flatten()[:5])
+            HR = self.get_H_op(ik, R)
+
+            # H to be updated
+            H1 = np.zeros([ns*2, ns*2], dtype=complex)
+            S1 = np.zeros([ns*2, ns*2], dtype=complex)
+
+            # Build H from
+            if i == 0:
+                H1[:ns, :ns] = psi.conj() @ H.T
+            else:
+                for ii in range(ns):
+                    H1[ii, ii] = eigval0[ii]
+                #np.fill_diagonal(H1, eigval0)
+
+            H1[:ns, ns:] = psi.conj() @ HR.T
+            H1[ns:, ns:] = R.conj() @ HR.T
+            H1[ns:, :ns] = H1[:ns, ns:].T.conj()
+
+            # Build S
+            S1[:ns, :ns] = np.diag([1.+ 0.j] * ns)
+            S1[:ns, ns:] = psi.conj() @ R.T
+            S1[ns:, ns:] = R.conj() @ R.T
+            S1[ns:, :ns] = S1[:ns, ns:].T.conj()
+
+            # Average
+            H1 = 0.5 * (H1 + H1.T.conj())
+            S1 = 0.5 * (S1 + S1.T.conj())
+
+            # New solution
+            hd = np.diag(np.diag(H1))
+            sd = np.diag(np.diag(S1))
+            H1 = np.triu(H1) + np.conj(np.triu(H1)- hd).T - 1.j*hd.imag
+            S1 = np.triu(S1) + np.conj(np.triu(S1)- sd).T - 1.j*sd.imag
+
+            #print('H1', H1[:ns, ns:])
+            #print('S1', S1[:ns, ns:])
+            lam_red, psi_red = linalg.eigh(H1, S1)
+
+            # update eigvalue and psi
+            eigval1 = lam_red[:ns].real
+
+            psi = -psi_red[:ns, :ns].T @ psi - psi_red[ns:, :ns].T @ R
+            H = -psi_red[:ns, :ns].T @ H - psi_red[ns:, :ns].T @ HR
+
+            # get residual
+            R = eigval1[:, None] * psi - H  # (ns, ngs)
             residual = np.sqrt(np.einsum('ij,ij->i', R, R.conj()).real)
-            print('res', residual)
 
-            for i in range(50):
-                res_norm = 1.0 /residual
-                R *= res_norm[:, None] 
-                R /= (self.pw.psi_1d + 1.0)
+            # Check convergence
+            d_eigval = ((eigval1 - eigval0)**2).sum()
+            #print(i, 'eigval', ik, eigval1, d_eigval)
+            if d_eigval < 1e-6:
+                #print("Converged", d_eigval)
+                break
 
-                HR = self.get_op_H(R)
+            eigval0 = eigval1
 
-                H1 = np.zeros([ns*2, ns*2], dtype=complex)
-                S1 = np.zeros([ns*2, ns*2], dtype=complex)
-
-                # Build H
-                if i == 0:
-                    H1[:ns, :ns] = psi @ H.T
-                else:
-                    H1.diag = eigval0
-
-                H1[:ns, ns:] = psi @ HR.T
-                H1[ns:, ns:] = psi.conj() @ HR.T
-                H1[ns:, :ns] = HR[:ns, ns:].T.conj()
-
-                # Build S
-                S1[:ns, :ns] = np.diag(ns)
-                S1[:ns, ns:] = psi.conj() @ R.T
-                S1[ns:, ns:] = R.conj @ R.T
-                S1[ns:, :ns] = S[:ns, ns:].T.conf()
-
-                H1 = 0.5 * (H1 + H1.conj())
-                S1 = 0.5 * (S1 + S1.conj())
-
-                H11 = np.triu(H1) + np.conj()
-
-                lr, Xr = np.linalg.eigh(H11, S11)
-
-                # update eigvalue and psi
-                eigval = lr.real
-                psi = None
-
-                d_eigval = ((eigval - eigval0)**2).sum()
-                if d_eigval < 1e-10:
-                    break
-
-        return eigval0[:ns], psi[:ns]
+        return eigval1, psi
 
     def scf(self, max_iter=50):
-        pass
-        #eigval0, psi0 = self.diag()
-        #E0 = self.get_E_total()
 
-        #for i in range(max_iter):
-        #    # update wavefunctions and electron density
-        #    self.pw.psi_1d = **
-        #    self.pw.get_psi_3d()
-        #    self.pw.get_rho_r()
-        #    
-        #    # mixing
-        #    rho_new = rho_new * 0.8 + rho_new1 * 0.2
-        #    d_rho = np.sum(np.abs(rho_new - rho_new1))
+        E0 = self.get_E_total()
+        rho_0 = self.pw.rho_r
 
-        #    E1 = self.get_E_total()
-        #    dE = E1 - E0
+        for i in range(max_iter):
+            # update wavefunctions and electron density
+            for ik in range(self.pw.n_kpts):
+                eigval, psi = self.diag(ik)
+                self.pw.psi_1d[ik] = psi
 
-        #    print(f"scf{:3d} dE: {:12.8f} E_total:{:12.6f} drho:{12.4f}")
+            self.pw.get_psi_3d()
+            self.pw.get_rho_r()
+            rho = self.pw.rho_r
+            
+            # mixing
+            rho = rho * 0.8 + rho_0 * 0.2
+            d_rho = np.sum(np.abs(rho - rho_0))
 
-        #    if dE < 1e-10 and d_rho < 1e-3 and d_eigval < 1e-6:
-        #        print("\nSCF is Converged")
-        #        break
+            E1 = self.get_E_total()
+            dE = E1 - E0
+
+            print(f"SCF{i:3d} dE:{dE:12.8f} E_total:{E1:12.6f} drho:{d_rho:12.4f}")
+            print(self)
+
+            if dE < 1e-10 and d_rho < 1e-3:
+                print("\nSCF is Converged")
+                break
+
+            E0 = E1
+            rho_0 = rho
 
     def get_E_Kinetic(self):
         E = 0.0
@@ -730,4 +793,6 @@ if __name__ == "__main__":
     ham.get_H_op()
     ham.get_E_total()
     print(ham)
-    #ham.diag_davidson()
+    #ham.diag()
+    ham.scf()
+
