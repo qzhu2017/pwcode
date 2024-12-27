@@ -58,9 +58,9 @@ class PlaneWaveBasis:
         Gmax = 2 * np.sqrt(2 * self.Ecutwfc)
         inv_lat_t = np.linalg.inv(self.model.rec_lattice.T)
         norm = np.ceil(np.linalg.norm(inv_lat_t, axis=1) * Gmax)
-        self.fx = int(norm[0])
-        self.fy = int(norm[1])
-        self.fz = int(norm[2])
+        self.fx = int(norm[0]) + 2
+        self.fy = int(norm[1]) + 2
+        self.fz = int(norm[2]) + 2
         grids = np.array([self.fx, self.fy, self.fz], dtype=int)
         self.grids = 2 * grids + 1
         self.num_grids = np.prod(self.grids)
@@ -431,7 +431,7 @@ class PspHgh:
         """
         dvol = pw.model.volume / pw.num_grids
         E_loc = (self.v_loc_r.real * pw.rho_r).sum() * dvol
-        self.E_loc = E_loc
+        return E_loc
 
     def get_E_nloc(self, pw):
 
@@ -481,7 +481,7 @@ class Hamiltionian:
 
         # energies
         self.E_Kinetic = 0
-        self.E_ps_loc = psp.E_loc
+        self.E_ps_loc = 0 #psp.E_loc
         self.E_XC = 0
         self.E_Hartree = 0
         self.E_ps_nloc = 0
@@ -502,6 +502,7 @@ class Hamiltionian:
     def get_E_total(self):
         self.E_XC = self.get_E_XC()
         self.E_Hartree = self.get_E_Hartree()
+        self.E_ps_loc = self.get_E_ps_loc()
         self.E_ps_nloc = self.get_E_ps_nloc()
         self.E_Kinetic = self.get_E_Kinetic()
         self.E_total = self.E_ps_loc + self.E_XC + self.E_Hartree
@@ -509,7 +510,7 @@ class Hamiltionian:
         return self.E_total
 
     def get_H_op(self, ik=0, psi=None, verbose=False):
-    
+        #self.V_ps_loc = np.load("source/V_loc_r.npy")
         if psi is None: psi = self.pw.psi_1d[ik]
 
         ns = len(psi)
@@ -542,16 +543,17 @@ class Hamiltionian:
         H = T + Vg + V_ps_nloc
 
         if verbose:
-            print("debug psi", psi.real.flatten()[:5])
-            print("debug Kinetic", T.real.flatten()[:5], T.sum())
+            print("debug psi", psi.real.flatten()[:5], psi.real.flatten().sum())
+            print("debug Kinetic", T.real.flatten()[:5], T[0].sum())
             print("debug V_XC", self.V_XC.flatten()[:5], self.V_XC.sum())
             print("debug V_Hartree", self.V_Hartree.flatten()[:5], self.V_Hartree.sum())
             print("debug V_ps_loc", self.V_ps_loc.flatten().real[:5], self.V_ps_loc.sum())
             print("debug V_ps_loc", self.V_ps_loc.flatten().real[-5:])
             print("debug V_total", V.flatten().real[:5], V.sum())
-            print("debug V_ps_nloc", V_ps_nloc[0].flatten()[:5])
+            print("debug V_ps_nloc", V_ps_nloc[0].flatten()[:5], V_ps_nloc[0].flatten().sum())
             for i in range(ns):
                 print('op_H', H[i].flatten()[:5].real)
+            print("debug rho", self.pw.rho_r.sum())
 
         return H
 
@@ -568,9 +570,73 @@ class Hamiltionian:
 
     def get_V_XC(self):
         """
-        get V_xc in 3d real space
+        Get XC from libxc via python wrapper
         """
-        return -0.5 * np.cbrt(3. * self.pw.rho_r / np.pi)
+        import pylibxc
+
+        rho = self.pw.rho_r
+        func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
+        results = func.compute({"rho": rho})  
+        V_X = results["zk"]
+        func = pylibxc.LibXCFunctional("lda_c_pw", "unpolarized")
+        results = func.compute({"rho": rho})
+        V_C = results["zk"]
+        return (V_X + V_C).reshape(self.pw.grids)
+
+    def get_V_XC_PW(self):
+        """
+        Get V_XC (Exchange-Correlation potential) in 3D real space using LDA.
+        Uses the Perdew-Zunger (PZ81) parametrization for correlation.
+        """
+        # Constants
+        pi = np.pi
+    
+        # Electron density
+        rho = np.array(self.pw.rho_r, dtype=np.float64)  # Ensure double precision
+        rho = np.maximum(rho, 1e-10)  # Avoid division by zero
+    
+        # 1. Exchange Potential (V_X)
+        V_X = -0.75 * (3.0 * rho / pi) ** (1 / 3)
+    
+        # 2. Correlation Potential (V_C) using PZ81
+        # Compute Wigner-Seitz radius (rs)
+        rs = (3 / (4 * pi * rho)) ** (1 / 3)
+        rs = np.minimum(rs, 1e6)  # Avoid excessively large values
+
+    
+        # PZ81 Parameters
+        A, B, C, D = 0.0311, -0.048, 0.002, -0.0116  # High-density (rs < 1)
+        A_low, B_low, C_low = 0.0311, -0.01342, 0.00435  # Low-density (rs >= 1)
+    
+        # Correlation energy per particle, eps_C(rs)
+        eps_C = np.zeros_like(rs)
+        V_C = np.zeros_like(rs)
+    
+        # High-density region (rs < 1)
+        mask_high = rs < 1
+        rs_high = rs[mask_high]
+    
+        eps_C[mask_high] = -A + B * rs_high * np.log(rs_high) + C * rs_high
+        V_C[mask_high] = -A + (B * (np.log(rs_high) + 1)) + C * rs_high
+    
+        # Low-density region (rs >= 1)
+        mask_low = ~mask_high
+        rs_low = rs[mask_low]
+    
+        # Corrected formula for correlation energy and potential
+        eps_C[mask_low] = -A_low / (1 + B_low * np.sqrt(rs_low) + C_low * rs_low)
+        V_C[mask_low] = eps_C[mask_low] - (1 / 6) * (B_low / np.sqrt(rs_low) + C_low)
+
+        # Add derivative correction for low-density region
+        #V_C[mask_low] = eps_C[mask_low] * (1 + 
+        #                              (B_low / np.sqrt(rs_low) + C_low) /
+        #                              (1 + B_low * np.sqrt(rs_low) + C_low * rs_low))
+        # 3. Total XC potential
+        V_XC = V_X + V_C
+    
+        return V_XC
+
+
     
     def get_V_Hartree(self):
         """
@@ -588,36 +654,35 @@ class Hamiltionian:
         #self.V_Hartree = np.real(np.fft.ifftn(V_g))
         return np.real(np.fft.ifftn(V_g))
 
-    def diag(self, ik=0):
+    def diag(self, psi, ik=0, debug=False):
         """
         Davidson dialgonalization
         """
-        ns = len(self.pw.psi_1d[0])
-        psi = self.pw.psi_1d[ik]
-        H = self.get_H_op(ik)#, verbose=True)
+        ns = len(psi)
+        HX = self.get_H_op(ik, psi, verbose=True)
+        #HX = np.load('source/a.npy')
+        #if debug: import sys; sys.exit()
 
         # Initial guess eigenvalues
-        eigval0 = (H * psi.conj()).sum(axis=1).real
-        #print("1st psi", psi.flatten()[:5])
-        #print("1st H", H.flatten()[:5], H.sum())
-        #print('eigval', ik, eigval0)
+        eigval0 = (psi.conj() * HX).sum(axis=1).real  # HV
+        print('eigval', ik, eigval0, HX.shape, psi.shape)
 
-        # residuals
-        R = eigval0[:, None] * psi - H  # (ns, ngs)
-        residual = np.sqrt(np.einsum('ij,ij->i', R, R.conj()).real)
-        #print('RRRRRR', R.flatten()[:5])
-        #print('res', residual)
+        # residuals R = eig*X - HX 
+        R = eigval0[:, None] * psi - HX  # (ns, ngs)
+        residual = np.sqrt((R * R.conj()).sum(axis=1).real)
 
         for i in range(50):
             res_norm = 1.0 /residual
             R *= res_norm[:, None] 
             R = self.pw.precondition_KE(R, ik)
             #R = R / (1 + (self.pw.g_wfcs[ik]**2).sum(axis=1))
+            #print('debug R', R[0, :5])
+            #print('debug res_norm', res_norm)
 
-            # H in the subspace, check====
-            #print('res_norm', res_norm)
-            #print('precondiction', R.flatten()[:5])
+            # H of R
             HR = self.get_H_op(ik, R)
+            #HR = np.load(f'source/{i}.npy')
+            #print('debug HR', HR[0, :5])
 
             # H to be updated
             H1 = np.zeros([ns*2, ns*2], dtype=complex)
@@ -625,49 +690,44 @@ class Hamiltionian:
 
             # Build H from
             if i == 0:
-                H1[:ns, :ns] = psi.conj() @ H.T
+                H1[:ns, :ns] = psi.conj() @ HX.T
             else:
-                for ii in range(ns):
-                    H1[ii, ii] = eigval0[ii]
-                #np.fill_diagonal(H1, eigval0)
+                np.fill_diagonal(H1, eigval0)
 
             H1[:ns, ns:] = psi.conj() @ HR.T
             H1[ns:, ns:] = R.conj() @ HR.T
-            H1[ns:, :ns] = H1[:ns, ns:].T.conj()
+            H1[ns:, :ns] = H1[:ns, ns:].conj().T
 
             # Build S
             S1[:ns, :ns] = np.diag([1.+ 0.j] * ns)
             S1[:ns, ns:] = psi.conj() @ R.T
             S1[ns:, ns:] = R.conj() @ R.T
-            S1[ns:, :ns] = S1[:ns, ns:].T.conj()
+            S1[ns:, :ns] = S1[:ns, ns:].conj().T
 
             # Average
             H1 = 0.5 * (H1 + H1.T.conj())
             S1 = 0.5 * (S1 + S1.T.conj())
-
-            # New solution
             hd = np.diag(np.diag(H1))
             sd = np.diag(np.diag(S1))
-            H1 = np.triu(H1) + np.conj(np.triu(H1)- hd).T - 1.j*hd.imag
-            S1 = np.triu(S1) + np.conj(np.triu(S1)- sd).T - 1.j*sd.imag
+            H1 = np.triu(H1) + np.conj(np.triu(H1)-hd).T  - 1.j*hd.imag
+            S1 = np.triu(S1) + np.conj(np.triu(S1)-sd).T  - 1.j*sd.imag
 
-            #print('H1', H1[:ns, ns:])
-            #print('S1', S1[:ns, ns:])
             lam_red, psi_red = linalg.eigh(H1, S1)
 
             # update eigvalue and psi
             eigval1 = lam_red[:ns].real
-
-            psi = -psi_red[:ns, :ns].T @ psi - psi_red[ns:, :ns].T @ R
-            H = -psi_red[:ns, :ns].T @ H - psi_red[ns:, :ns].T @ HR
+            psi = psi_red[:ns, :ns].T @ psi + psi_red[ns:, :ns].T @ R
+            HX = psi_red[:ns, :ns].T @ HX + psi_red[ns:, :ns].T @ HR
+            HX *= -1
+            psi *= -1
 
             # get residual
-            R = eigval1[:, None] * psi - H  # (ns, ngs)
+            R = eigval1[:, None] * psi - HX  # (ns, ngs)
             residual = np.sqrt(np.einsum('ij,ij->i', R, R.conj()).real)
 
             # Check convergence
-            d_eigval = ((eigval1 - eigval0)**2).sum()
-            #print(i, 'eigval', ik, eigval1, d_eigval)
+            d_eigval = np.abs(eigval1[:ns] - eigval0[:ns]).sum() 
+            print(i, 'eigval', ik, eigval1[:4], d_eigval, residual[0])
             if d_eigval < 1e-6:
                 #print("Converged", d_eigval)
                 break
@@ -682,23 +742,35 @@ class Hamiltionian:
         rho_0 = self.pw.rho_r
 
         for i in range(max_iter):
-            # update wavefunctions and electron density
+            # update eigenwavefunctions
             for ik in range(self.pw.n_kpts):
-                eigval, psi = self.diag(ik)
-                self.pw.psi_1d[ik] = psi
+                psi = self.pw.psi_1d[ik]
+                if i>0: 
+                    debug = True
+                else:
+                    debug = False
+                eigval, psi = self.diag(psi, ik, debug)
+                self.pw.psi_1d[ik] = self.pw.orthonormalize(psi)
 
             self.pw.get_psi_3d()
             self.pw.get_rho_r()
-            rho = self.pw.rho_r
-            
+          
             # mixing
+            rho = self.pw.rho_r
             rho = rho * 0.8 + rho_0 * 0.2
+            self.pw.rho_r = rho
             d_rho = np.sum(np.abs(rho - rho_0))
 
+            # Update H
+            V_XC = self.get_V_XC()
+            V_H = self.get_V_Hartree()
+            self.V_XC = V_XC
+            self.V_Hartree = V_H
+            self.V_total = self.V_ps_loc.real + V_XC + V_H
             E1 = self.get_E_total()
             dE = E1 - E0
 
-            print(f"SCF{i:3d} dE:{dE:12.8f} E_total:{E1:12.6f} drho:{d_rho:12.4f}")
+            print(f"SCF{i:3d} dE:{dE:12.8f} E_total:{E1:12.6f} drho:{d_rho:12.4f} {rho.sum()}")
             print(self)
 
             if dE < 1e-10 and d_rho < 1e-3:
@@ -707,6 +779,7 @@ class Hamiltionian:
 
             E0 = E1
             rho_0 = rho
+        print("Final eigval", eigval)
 
     def get_E_Kinetic(self):
         E = 0.0
@@ -724,16 +797,20 @@ class Hamiltionian:
 
     def get_E_XC(self):
         dvol = self.pw.model.volume / self.pw.num_grids
-        E = 0.5 * (self.V_XC * self.pw.rho_r).sum() * dvol
+        E = (self.V_XC * self.pw.rho_r).sum() * dvol
         return E
 
     def get_E_Hartree(self):
         dvol = self.pw.model.volume / self.pw.num_grids
         E = 0.5 * (self.V_Hartree * self.pw.rho_r).sum() * dvol
+        print(self.pw.rho_r.sum()*dvol, self.pw.rho_r.sum()*self.pw.model.volume / self.pw.num_grids)
         return E
 
     def get_E_ps_nloc(self):
         return self.psp.get_E_nloc(self.pw)
+ 
+    def get_E_ps_loc(self):
+        return self.psp.get_E_loc(self.pw)
  
     def get_E_nn(self):
         """
@@ -789,10 +866,31 @@ if __name__ == "__main__":
     #for i in range(len(V)): print(V[i, 0], pw.psi_1d[0][i, 0])
 
     # Hamiltonian
+    #ham = Hamiltionian(pw, psp)
+    #ham.get_H_op()
+    #ham.get_E_total()
+    #print(ham)
+    #ham.diag()
+    #ham.scf(50)
+    
+    import h5py
+    
+    # Open the HDF5 file
+    with h5py.File('wavefunction_f.h5', 'r') as f:
+        # Load wavefunctions
+        print(list(f.keys()))
+        psi = [f[key][:] for key in f.keys()]  # Each ψ[i] is a complex 2D array
+
+    print(psi)
+    print("ψ[0] shape:", psi[0].shape)
+
+    pw.psi_1d[0] = pw.orthonormalize(psi[0][:6])
+    pw.get_psi_3d()
+    pw.get_rho_r()
+
+    #pw.g_wfcs[0] = gvecs[0]
     ham = Hamiltionian(pw, psp)
     ham.get_H_op()
     ham.get_E_total()
     print(ham)
-    #ham.diag()
-    ham.scf()
-
+    #ham.scf(1)
