@@ -58,9 +58,9 @@ class PlaneWaveBasis:
         Gmax = 2 * np.sqrt(2 * self.Ecutwfc)
         inv_lat_t = np.linalg.inv(self.model.rec_lattice.T)
         norm = np.ceil(np.linalg.norm(inv_lat_t, axis=1) * Gmax)
-        self.fx = int(norm[0]) + 2
-        self.fy = int(norm[1]) + 2
-        self.fz = int(norm[2]) + 2
+        self.fx = int(norm[0]) #+ 2
+        self.fy = int(norm[1]) #+ 2
+        self.fz = int(norm[2]) #+ 2
         grids = np.array([self.fx, self.fy, self.fz], dtype=int)
         self.grids = 2 * grids + 1
         self.num_grids = np.prod(self.grids)
@@ -277,8 +277,8 @@ class PspHgh:
         V = np.zeros(len(g2), dtype=complex)
 
         # only deal with non-zero g vectors
-        ids = g2 > 1e-8
-        ids0 = g2 <= 1e-8
+        ids = g2 > 1e-2
+        ids0 = g2 <= 1e-2
         g2 = g2[ids]
 
         rloc = self.rloc
@@ -297,11 +297,12 @@ class PspHgh:
         V[ids] = term1 + term2
         
         if True: #False:
-            term0 =  (2 * np.pi)**1.5 * rloc**3 * (self.cloc[0] +
-                     3.0 * self.cloc[1] + 
-                     15.0 * self.cloc[2] + 
+            term0 = (2. * np.pi)**1.5 * rloc**3 * (self.cloc[0] +
+                     3. * self.cloc[1] + 
+                     15. * self.cloc[2] + 
                      105. * self.cloc[3])
             V[ids0] = 2 * np.pi * Z * rloc**2 + term0
+        #print("Debug", len(V[ids0])); import sys; sys.exit()
 
         return V 
 
@@ -389,12 +390,11 @@ class PspHgh:
         v_loc_g_1D *= sf / vol
 
         # convert to 3D
-        v_loc_g[g_masks] = v_loc_g_1D
+        v_loc_g[g_masks] = v_loc_g_1D.conj()
 
         # fft to real space
-        v_loc_r = np.zeros(grids, dtype=complex)
-        v_loc_r = np.fft.ifftn(v_loc_g) * n_grids
-        self.v_loc_r = v_loc_r
+        self.v_loc_g = v_loc_g #_1D
+        self.v_loc_r = np.fft.ifftn(v_loc_g).real * n_grids
 
     def get_v_nloc(self, pw, psi=None, ik=0):
 
@@ -419,7 +419,6 @@ class PspHgh:
                     coef = self.h[l1][i1-1, i2-1]
                     tmp2 = np.einsum('ij,jk->ki', beta[id1], out[id2])
                     V += coef * tmp2.conj() 
-        #for i in range(len(V)): print("V_nloc", V[i, 0], psi[i, 0])
         return V
 
     def get_E_loc(self, pw):
@@ -430,7 +429,7 @@ class PspHgh:
             pw: planewave instance
         """
         dvol = pw.model.volume / pw.num_grids
-        E_loc = (self.v_loc_r.real * pw.rho_r).sum() * dvol
+        E_loc = (self.v_loc_r * pw.rho_r).sum() * dvol
         return E_loc
 
     def get_E_nloc(self, pw):
@@ -452,7 +451,7 @@ class PspHgh:
                         beta2 = (out[idx1] * out[idx2].conj()).real
                         beta2 = beta2 * occs[None, None, :]
                         E += coef * np.sum(beta2)
-        return E
+        return 2*E
 
 
 class Hamiltionian:
@@ -543,8 +542,8 @@ class Hamiltionian:
         H = T + Vg + V_ps_nloc
 
         if verbose:
-            print("debug psi", psi.real.flatten()[:5], psi.real.flatten().sum())
-            print("debug Kinetic", T.real.flatten()[:5], T[0].sum())
+            print("debug psi", psi[0][:5], psi.real.flatten().sum())
+            print("debug V_Kin", T[0,:5], T.sum())
             print("debug V_XC", self.V_XC.flatten()[:5], self.V_XC.sum())
             print("debug V_Hartree", self.V_Hartree.flatten()[:5], self.V_Hartree.sum())
             print("debug V_ps_loc", self.V_ps_loc.flatten().real[:5], self.V_ps_loc.sum())
@@ -552,11 +551,25 @@ class Hamiltionian:
             print("debug V_total", V.flatten().real[:5], V.sum())
             print("debug V_ps_nloc", V_ps_nloc[0].flatten()[:5], V_ps_nloc[0].flatten().sum())
             for i in range(ns):
-                print('op_H', H[i].flatten()[:5].real)
+                print('op_H', H[i].flatten()[:5])
             print("debug rho", self.pw.rho_r.sum())
 
         return H
 
+
+    def get_E_Kinetic(self):
+        E = 0.0
+        occs = self.pw.occs
+        for ik in range(self.pw.n_kpts):
+            k = self.pw.kpoints[ik]
+            gs = self.pw.g_wfcs[ik]
+            g2s = np.sum((gs + k)**2, axis=1)
+
+            psi = self.pw.psi_1d[ik]
+            factor = occs[:, None] * g2s[None, :]
+            E += ((psi.conj() * psi).real * factor).sum()
+
+        return E
 
     def get_K_op(self, psi_1d, ik):
         """
@@ -665,7 +678,8 @@ class Hamiltionian:
 
         # Initial guess eigenvalues
         eigval0 = (psi.conj() * HX).sum(axis=1).real  # HV
-        print('eigval', ik, eigval0, HX.shape, psi.shape)
+        print('Initial eigval', ik, eigval0, HX.shape, psi.shape)
+        import sys; sys.exit()
 
         # residuals R = eig*X - HX 
         R = eigval0[:, None] * psi - HX  # (ns, ngs)
@@ -727,7 +741,7 @@ class Hamiltionian:
 
             # Check convergence
             d_eigval = np.abs(eigval1[:ns] - eigval0[:ns]).sum() 
-            print(i, 'eigval', ik, eigval1[:4], d_eigval, residual[0])
+            #print(i, 'eigval', ik, eigval1[:4], d_eigval, residual[0])
             if d_eigval < 1e-6:
                 #print("Converged", d_eigval)
                 break
@@ -750,6 +764,7 @@ class Hamiltionian:
                 else:
                     debug = False
                 eigval, psi = self.diag(psi, ik, debug)
+                import sys; sys.exit()
                 self.pw.psi_1d[ik] = self.pw.orthonormalize(psi)
 
             self.pw.get_psi_3d()
@@ -780,20 +795,6 @@ class Hamiltionian:
             E0 = E1
             rho_0 = rho
         print("Final eigval", eigval)
-
-    def get_E_Kinetic(self):
-        E = 0.0
-        occs = self.pw.occs
-        for ik in range(self.pw.n_kpts):
-            k = self.pw.kpoints[ik]
-            gs = self.pw.g_wfcs[ik]
-            g2s = np.sum((gs + k)**2, axis=1)
-
-            psi = self.pw.psi_1d[ik]
-            factor = occs[:, None] * g2s[None, :]
-            E += ((psi.conj() * psi).real * factor).sum()
-
-        return E
 
     def get_E_XC(self):
         dvol = self.pw.model.volume / self.pw.num_grids
@@ -839,7 +840,7 @@ if __name__ == "__main__":
                                           #[0, 0.5, 0],
                                           #[0.5, 0, 0.5],
                                           ]), 
-                        kweights=np.array([1.]),#, 6., 8., 12.])/27.,
+                        kweights=np.array([1]),#., 6., 8., 12.])/27.,
                         occs = np.array([1, 1, 1, 1, 0, 0]),
                         )
     print(pw)
@@ -873,24 +874,72 @@ if __name__ == "__main__":
     #ham.diag()
     #ham.scf(50)
     
-    import h5py
-    
-    # Open the HDF5 file
-    with h5py.File('wavefunction_f.h5', 'r') as f:
-        # Load wavefunctions
-        print(list(f.keys()))
-        psi = [f[key][:] for key in f.keys()]  # Each ψ[i] is a complex 2D array
+    # Load DFTK results
+    #import h5py
+    ## Open the HDF5 file
+    #with h5py.File('wavefunction_f.h5', 'r') as f:
+    #    # Load wavefunctions
+    #    print(list(f.keys()))
+    #    psi = [f[key][:] for key in f.keys()]  # Each ψ[i] is a complex 2D array
+    #print("ψ[0] shape:", psi[0].shape)
 
-    print(psi)
-    print("ψ[0] shape:", psi[0].shape)
+    # load and resort
+    psi = np.load('psiks.npy').T
+    ids = np.load('g.npy') - 1
+    ids2 = np.load('gr.npy') - 1
+    ids_sorted = ids.argsort()
+    ids2_sorted = ids2.argsort()
+    pw.psi_1d[0] = pw.orthonormalize(psi[:6])
+    pw.psi_1d[0] = pw.psi_1d[0][:, ids_sorted]
+    ids = ids[ids_sorted]
+    ids2 = ids2[ids2_sorted]
 
-    pw.psi_1d[0] = pw.orthonormalize(psi[0][:6])
+    [gx, gy, gz] = pw.grids
+    g_wfcs_3D = []
+    mask1 = np.zeros([gx, gy, gz], dtype=int)
+    mask2 = np.zeros([gx, gy, gz], dtype=int)
+    count = 0
+    for i in range(gx):
+        ii = i - gx if i > gx // 2 else i
+        for j in range(gy):
+            jj = j - gy if j > gy // 2 else j
+            for k in range(gz):
+                kk = k - gz if k > gz // 2 else k
+                g = np.array([ii, jj, kk]) 
+                g = g @ pw.model.rec_lattice
+                g_wfcs_3D.append(g)
+                if count in ids: mask1[i, j, k] = 1
+                if count in ids2: mask2[i, j, k] = 1
+                count += 1
+    g_wfcs_3D = np.array(g_wfcs_3D)
+    pw.g_wfcs[0] = g_wfcs_3D[ids]
+    pw.g_rhos = g_wfcs_3D[ids2]
+    pw.g_masks_w[0] = mask1.astype(bool)
+    pw.g_masks_r = mask2.astype(bool)
     pw.get_psi_3d()
     pw.get_rho_r()
 
-    #pw.g_wfcs[0] = gvecs[0]
     ham = Hamiltionian(pw, psp)
-    ham.get_H_op()
+    ham.get_H_op(verbose=True)
     ham.get_E_total()
     print(ham)
-    #ham.scf(1)
+    ham.scf(1)
+    #psp.get_v_loc_r(pw)
+    #p = psp.v_loc_r.flatten()
+    #Ps_loc = np.load("Ps_loc.npy")
+    #print(np.abs(p-Ps_loc).sum())
+    #rho = np.load("rho.npy")[:, 0]
+    #r = pw.rho_r.flatten()
+    #print("density 10", r[:10], r.shape)
+    #print("density 10", rho[:10], rho.shape)
+    #print("density diff", np.abs(r - rho).max())
+    #dvol = pw.model.volume / pw.num_grids
+    #E_loc1 = (p * r).sum() * dvol
+    #E_loc2 = (p * rho).sum() * dvol
+    #print("PS local energy", p.shape, r.shape, E_loc1, p.shape, rho.shape, E_loc2)
+
+    #p = np.load("source/V_loc_r.npy").real; print(p[0].sum(), p[0,0,:20])
+    """
+    V_loc_r sum is wrong
+    """
+
