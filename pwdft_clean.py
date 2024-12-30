@@ -1,3 +1,7 @@
+# to install pylibxc wrapper
+# git clone https://gitlab.com/libxc/libxc.git
+# pip install .
+
 import numpy as np
 from scipy.special import erf, sph_harm
 from scipy import linalg
@@ -136,6 +140,23 @@ class PlaneWaveBasis:
         """
         psi_sqrt = linalg.sqrtm(np.conj(psi) @ psi.T)
         return linalg.inv(psi_sqrt).T @ psi
+
+    #def orthonormalize(self, psi):
+    #    """
+    #    Make the wavefunction orthonormal using NumPy only.
+    #    S = psi^+ psi =>  psi => S^(-1/2) psi
+    #    """
+    #    # Compute overlap matrix S = psi^H psi
+    #    S = np.conj(psi) @ psi.T
+    #
+    #    # Eigenvalue decomposition: S = U Λ U^T
+    #    eigvals, eigvecs = np.linalg.eigh(S)
+    #    eigvals = np.maximum(eigvals, 1e-12) 
+    #    # Compute S^(-1/2) = U Λ^(-1/2) U^T
+    #    S_inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+    #
+    #    # Apply S^(-1/2) to orthonormalize psi
+    #    return S_inv_sqrt @ psi
 
     def random_guess(self):
         """
@@ -522,7 +543,7 @@ class Hamiltionian:
             ns = len(self.pw.psi_1d[0])
             strs += f"\n[{ns} states, {n_kpts} kpoints] in Hatree\n"
             for ik in range(n_kpts):
-                strs += " ".join(f"{x:12.6f}" for x in self.eigvals[ik]) + "\n"
+                strs += " ".join(f"{x:10.6f}" for x in self.eigvals[ik]) + "\n"
         return strs
 
     def get_E_total(self):
