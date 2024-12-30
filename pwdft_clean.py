@@ -1,10 +1,18 @@
 import numpy as np
-from scipy.special import erf, gamma, sph_harm
+from scipy.special import erf, sph_harm
 from scipy import linalg
 from scipy.fft import fftn, ifftn
+import pylibxc
 
 class Structure:
+
     def __init__(self, lattice, positions):
+        """
+        A class to represent a crystal structure.
+        Args:
+            lattice: array, The lattice vectors of the system.
+            positions: array, The fractional atomic coordinates.
+        """
         self.lattice = lattice
         self.rec_lattice = 2 * np.pi * np.linalg.inv(lattice)
         self.frac_positions = positions
@@ -31,7 +39,7 @@ class Structure:
 class PlaneWaveBasis:
     def __init__(self, model, Ecut, kpoints, kweights, occs):
         """
-        Parameters:
+        Args:
             model: The structure class instance.
             Ecut: float, The energy cutoff for the plane-wave basis.
             kpoints: array, The k-points used in the calculation.
@@ -88,7 +96,7 @@ class PlaneWaveBasis:
     def get_g_vectors(self):
         """
         Compute g-vectors and 3D masks for the FFT grid.
-        Note we have two cutoff values for electron density 
+        within cutoff values for electron density 
         and planewave expansions
         """
         n_kpts = self.n_kpts
@@ -99,7 +107,7 @@ class PlaneWaveBasis:
         g_masks_r = np.zeros([gx, gy, gz], dtype=int)
         g_masks_w = np.zeros([n_kpts, gx, gy, gz], dtype=int)
 
-        # a bit funny sorting (0, 1, 2, .., N, N-1, N-2, .... -1)
+        # (0, 1, 2, .., N, N-1, N-2, .... -1)
         for i in range(gx):
             ii = i - gx if i > gx // 2 else i
             for j in range(gy):
@@ -124,6 +132,7 @@ class PlaneWaveBasis:
     def orthonormalize(self, psi):
         """
         Make the wavefunction be orthonormal
+        S = psi^+ psi =>  psi => S^(-1/2) psi
         """
         psi_sqrt = linalg.sqrtm(np.conj(psi) @ psi.T)
         return linalg.inv(psi_sqrt).T @ psi
@@ -143,14 +152,13 @@ class PlaneWaveBasis:
             psi = real_part + 1j * imag_part
             psi = self.orthonormalize(psi)
             psi_1d[ik] = psi
-            print("create wavefunctions", ik, psi_1d[ik].shape)
         self.psi_1d = psi_1d
         self.get_psi_3d()
         self.get_rho_r()
 
     def get_psi_3d(self):
         """
-        get psi in 3d grids format
+        Get psi in 3d grids format
         """
         n_kpts = self.n_kpts
         psi_3d = [[] for _ in range(n_kpts)]
@@ -160,6 +168,13 @@ class PlaneWaveBasis:
         return psi_3d
 
     def get_psi_3d_single(self, psi_1d, ik):
+        """
+        Get psi in 3d grids format for a single kpoint
+
+        Args:
+            psi_1d: array, The wavefunction in 1D g-space.
+            ik: int, The k-point
+        """
         [gx, gy, gz] = self.grids
         mask = self.g_masks_w[ik]
         ns = len(psi_1d)
@@ -187,16 +202,6 @@ class PlaneWaveBasis:
                 rho += rho_r
         rho = np.maximum(rho, 2.22e-16)  # Avoid division by zero
         self.rho_r = rho
-
-    def precondition_KE(self, psi, ik):
-        """
-        Simple preconditioner based on kinetic energy
-        """
-        ns = len(psi[0])
-        gs = self.g_wfcs[ik][:ns] + self.kpoints[ik]
-        g2s = (gs**2).sum(axis=1)
-        psi /= (1.0 + g2s)
-        return psi
 
 class PspHgh:
     """
@@ -324,7 +329,9 @@ class PspHgh:
             return common * 2. / np.sqrt(15.) * (3 - x2)
 
     def get_ylm_real(self, g, l, m):
-        # compute spherical harmonics
+        """
+        compute spherical harmonics, see Appendix A (12.11)
+        """
         ylms = np.zeros(len(g))
         gm = np.linalg.norm(g, axis=1) + 1e-7
         theta = np.arccos(g[:, 2] / gm)
@@ -340,8 +347,11 @@ class PspHgh:
 
     def get_beta_nonlocal(self, pw):
         """
-        Get beta_ilm for the given structure
+        Get beta_ilm for the given structure eq. (12.13)
         [N_kpt][N_gx, N_atom]
+
+        Args:
+            pw: planewave instance
         """
         vol = pw.model.volume
         pos = pw.model.cart_positions
@@ -361,12 +371,11 @@ class PspHgh:
                 beta_ilm[id] = np.einsum('i,ij->ij', proj, sf) 
                 beta_ilm[id] *= (-1j)**l 
             beta_ilms[ik] = beta_ilm
-            print("initialize beta", ik, beta_ilms[ik].shape)
         self.beta_nl = beta_ilms
 
     def get_v_loc_r(self, pw):
         """
-        Compute the local V_ps for the given structure
+        Compute the structural V_ps_local, eq. (12.11)-(12.12) 
 
         Args:
             pw: planewave instance
@@ -392,6 +401,14 @@ class PspHgh:
         self.v_loc_r = np.fft.ifftn(v_loc_g).real * n_grids
 
     def get_v_nloc(self, pw, psi=None, ik=0):
+        """
+        Compute the structural V_ps_nonlocal with eq(12.14)
+
+        Args:
+            pw: planewave instance
+            psi: array, The wavefunction in 1D g-space.
+            ik: int, The k-point
+        """
 
         if psi is None:
             psi = pw.psi_1d[ik] # (N_states, Ngx)
@@ -420,7 +437,7 @@ class PspHgh:
 
     def get_E_loc(self, pw):
         """
-        Compute the local E_ps for the given structure
+        Compute the structural E_ps_local, eq. (12.23) 
 
         Args:
             pw: planewave instance
@@ -430,6 +447,9 @@ class PspHgh:
         return E_loc
 
     def get_E_nloc(self, pw):
+        """
+        Compute the structural E_ps_nlocal, eq. (12.24)
+        """
 
         E = 0
         occs = pw.occs
@@ -456,10 +476,9 @@ class Hamiltionian:
     """
     A class to compute the hamiltonian
     
-    Parameters:
-        pw: float, The ionic charge.
-        V_ps_loc: array-like
-        ps_beta_nl:
+    Args:
+        pw: PlaneWaveBasis, The planewave basis.
+        psp: PspHgh, The pseudopotential in the HGH form.
     """
 
     def __init__(self, pw, psp):
@@ -484,9 +503,12 @@ class Hamiltionian:
         self.E_ps_nloc = 0
         self.E_total = 0
         self.E_NN = -8.3979274
+
+        # SCF
+        self.converged = False
     
     def __str__(self):
-        strs = "\nHamiltonian"
+        strs = "\nHamiltonian (in Hartree)"
         strs += f"\nE_Kinetic:   {self.E_Kinetic:12.6f}"
         strs += f"\nE_ps_local:  {self.E_ps_loc:12.6f}"
         strs += f"\nE_ps_nloc:   {self.E_ps_nloc:12.6f}"
@@ -494,9 +516,19 @@ class Hamiltionian:
         strs += f"\nE_XC:        {self.E_XC:12.6f}"
         strs += f"\nE_NN:        {self.E_NN:12.6f}"
         strs += f"\nE_total:     {self.E_total:12.6f}"
+
+        if hasattr(self, 'eigvals'):
+            n_kpts = self.pw.n_kpts
+            ns = len(self.pw.psi_1d[0])
+            strs += f"\n[{ns} states, {n_kpts} kpoints] in Hatree\n"
+            for ik in range(n_kpts):
+                strs += " ".join(f"{x:12.6f}" for x in self.eigvals[ik]) + "\n"
         return strs
 
     def get_E_total(self):
+        """
+        Compute the total energy, eq. (12.17)
+        """
         self.E_XC = self.get_E_XC()
         self.E_Hartree = self.get_E_Hartree()
         self.E_ps_loc = self.get_E_ps_loc()
@@ -506,8 +538,10 @@ class Hamiltionian:
         self.E_total += self.E_ps_nloc + self.E_Kinetic + self.E_NN
         return self.E_total
 
-    def get_H_op(self, ik=0, psi=None, verbose=False):
-        #self.V_ps_loc = np.load("source/V_loc_r.npy")
+    def get_H_op(self, ik=0, psi=None):
+        """
+        Compute the Hamiltonian operator, eq. (12.18)
+        """
         if psi is None: psi = self.pw.psi_1d[ik]
 
         ns = len(psi)
@@ -539,24 +573,50 @@ class Hamiltionian:
         # Get the H
         H = T + Vg + V_ps_nloc
 
-        if verbose:
-            print("debug psi", psi[0][:2], psi.real.flatten().sum())
-            print("debug V_XC", self.V_XC.flatten()[:10], self.V_XC.sum())
-            print("debug V_ps_loc", self.V_ps_loc.flatten().real[:2], self.V_ps_loc.sum())
-            print("debug V_Hartree", self.V_Hartree.flatten()[:2], self.V_Hartree.sum())
-            print("debug V_total", V.flatten().real[:2], V.sum())
-            print("debug V_Kin", T[0,:2], T.sum())
-            print("debug V_gg", Vg.flatten().real[:2], Vg.sum())
-            print("debug V_ps_nloc", V_ps_nloc.flatten().real[:2], V_ps_nloc.sum())
-            print("debug H", H.flatten().real[:2], H.sum())
-            #for i in range(ns):
-            #    print('op_H', H[i].flatten()[:5])
-            print("debug rho", self.pw.rho_r.sum())
-
         return H
 
+    def get_K_op(self, psi_1d, ik):
+        """
+        Get kinetic operator in 1D g space (eq. 12.21)
+        """
+        k = self.pw.kpoints[ik]
+        gs = self.pw.g_wfcs[ik]
+        g2s = np.sum((gs + k)**2, axis=1)
+        T = 0.5 * (g2s * psi_1d)
+        return T
 
+    def get_V_XC(self):
+        """
+        Get V_XC from libxc from pylibxc
+        """
+        rho = self.pw.rho_r
+        func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
+        results = func.compute({"rho": rho})  
+        V_X = results["vrho"]  #["zk"]
+        func = pylibxc.LibXCFunctional("lda_c_vwn", "unpolarized")
+        results = func.compute({"rho": rho})
+        V_C = results["vrho"] #["zk"]
+        return (V_X + V_C).reshape(self.pw.grids)
+
+    def get_V_Hartree(self):
+        """
+        Get Hartree potential in 3D real space (eq. 12.25)
+        """
+        mask = self.pw.g_masks_r
+        gs = self.pw.g_rhos
+        g2 = (gs**2).sum(axis=1)  + 1e-12
+        rho_g = np.fft.fftn(self.pw.rho_r) * 4 * np.pi
+        V_g = np.zeros(self.pw.grids, dtype=complex)
+        V_g[mask] = rho_g[mask] / g2
+
+        # Reset the gamma to 0
+        V_g[0, 0, 0] = 0
+        return np.real(np.fft.ifftn(V_g))
+    
     def get_E_Kinetic(self):
+        """
+        Compute the kinetic energy, eq. (12.22)
+        """
         E = 0.0
         occs = self.pw.occs
         for ik in range(self.pw.n_kpts):
@@ -570,58 +630,62 @@ class Hamiltionian:
             E += ((psi.conj() * psi).real * factor).sum()
 
         return E
-
-    def get_K_op(self, psi_1d, ik):
+    
+    def get_E_XC(self):
         """
-        get kinetic operator in 1D g space
+        Compute the exchange-correlation energy from pylibxc
         """
-        k = self.pw.kpoints[ik]
-        gs = self.pw.g_wfcs[ik]
-        g2s = np.sum((gs + k)**2, axis=1)
-        T = 0.5 * (g2s * psi_1d)
-        return T
-
-    def get_V_XC(self):
-        """
-        Get XC from libxc via python wrapper
-        """
-        import pylibxc
-
         rho = self.pw.rho_r
         func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
         results = func.compute({"rho": rho})  
-        V_X = results["vrho"]  #["zk"]
+        V_X = results["zk"]
+        
         func = pylibxc.LibXCFunctional("lda_c_vwn", "unpolarized")
         results = func.compute({"rho": rho})
-        V_C = results["vrho"] #["zk"]
-        return (V_X + V_C).reshape(self.pw.grids)
+        V_C = results["zk"]
+        
+        V_XC = (V_X + V_C).reshape(self.pw.grids)
+        dvol = self.pw.model.volume / self.pw.num_grids
+        E = (V_XC * self.pw.rho_r).sum() * dvol
+        return E
 
-    def get_V_Hartree(self):
+    def get_E_Hartree(self):
         """
-        get V_hartree in 3D real space from electron density
+        Compute the Hartree energy, eq. (12.26)
         """
-        mask = self.pw.g_masks_r
-        gs = self.pw.g_rhos
-        g2 = (gs**2).sum(axis=1)  + 1e-12
-        rho_g = np.fft.fftn(self.pw.rho_r) * 4 * np.pi
-        V_g = np.zeros(self.pw.grids, dtype=complex)
-        V_g[mask] = rho_g[mask] / g2
+        dvol = self.pw.model.volume / self.pw.num_grids
+        E = 0.5 * (self.V_Hartree * self.pw.rho_r).sum() * dvol
+        return E
 
-        # Reset the gamma to 0
-        V_g[0, 0, 0] = 0
-        #self.V_Hartree = np.real(np.fft.ifftn(V_g))
-        return np.real(np.fft.ifftn(V_g))
+    def get_E_ps_nloc(self):
+        return self.psp.get_E_nloc(self.pw)
+ 
+    def get_E_ps_loc(self):
+        return self.psp.get_E_loc(self.pw)
+ 
+    def get_E_nn(self):
+        """
+        Ewald summation of the nuclear-nuclear energy (eq. 12.29)
+        """
+        pass
 
-    def diag(self, psi, ik=0, debug=False):
+    def diag(self, psi, ik=0):
         """
         Davidson dialgonalization
+
+        Args:
+            psi: array, The wavefunction in 1D g-space.
+            ik: int, The k-point
+        
+        Returns:
+            eigval1: array, The eigenvalues.
+            psi: array, The wavefunction in 1D g-space.
         """
         ns = len(psi)
         HX = self.get_H_op(ik, psi)
 
         # Initial guess eigenvalues
         eigval0 = (psi.conj() * HX).sum(axis=1).real  # HV
-        #print('Initial eigval', ik, eigval0, HX.shape, psi.shape)
 
         # residuals R = eig*X - HX 
         R = eigval0[:, None] * psi - HX  # (ns, ngs)
@@ -631,13 +695,10 @@ class Hamiltionian:
         for i in range(50):
             res_norm = 1.0 /residual
             R *= res_norm[:, None] 
-            #R = self.pw.precondition_KE(R, ik)
             R = R / (1 + (self.pw.g_wfcs[ik]**2).sum(axis=1))
 
             # H of R
             HR = self.get_H_op(ik, R)
-            #HR = np.load(f'source/{i}.npy')
-            #print('debug HR', HR[0, :5])
 
             # H to be updated
             H1 = np.zeros([ns*2, ns*2], dtype=complex)
@@ -664,14 +725,14 @@ class Hamiltionian:
             S1 = 0.5 * (S1 + S1.T.conj())
             lam_red, psi_red = linalg.eigh(H1, S1)
 
-            # update eigvalue and psi
+            # Update eigvalue and psi
             eigval1 = lam_red[:ns].real
             psi = psi_red[:ns, :ns].T @ psi + psi_red[ns:, :ns].T @ R
             HX = psi_red[:ns, :ns].T @ HX + psi_red[ns:, :ns].T @ HR
             HX *= -1
             psi *= -1
 
-            # get residual
+            # Get residual
             R = eigval1[:, None] * psi - HX  # (ns, ngs)
             residual = np.sqrt(np.einsum('ij,ij->i', R, R.conj()).real)
 
@@ -679,7 +740,6 @@ class Hamiltionian:
             d_eigval = np.abs(eigval1[:ns] - eigval0[:ns]).sum() 
             #print(i, 'eigval', ik, eigval1[:4], d_eigval, residual[0])
             if d_eigval < 1e-6:
-                #print("Converged", d_eigval)
                 break
 
             eigval0 = eigval1
@@ -700,14 +760,11 @@ class Hamiltionian:
 
             self.rho_old = self.pw.rho_r.copy()
             self.E_old = E
+
             # update eigenwavefunctions
             for ik in range(self.pw.n_kpts):
                 psi = self.pw.psi_1d[ik]
-                if i > 0: 
-                    debug = True
-                else:
-                    debug = False
-                eigval, psi = self.diag(psi, ik, debug)
+                eigval, psi = self.diag(psi, ik)
                 self.pw.psi_1d[ik] = self.pw.orthonormalize(psi)
                 eigvals[ik] = eigval
 
@@ -733,48 +790,12 @@ class Hamiltionian:
 
             if dE < de_tol: # and d_rho < 1e-1:
                 print("\nSCF is Converged")
+                self.converged = True
                 break
 
-        print(f"Final eigval {ns} states, {n_kpts} kpoints\n")
-        print(eigvals.T)
-
-    def get_E_XC(self):
-        import pylibxc
-        if True: #False:
-            rho = self.pw.rho_r
-            func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
-            results = func.compute({"rho": rho})  
-            V_X = results["zk"]
-            #func = pylibxc.LibXCFunctional("lda_c_pw", "unpolarized")
-            func = pylibxc.LibXCFunctional("lda_c_vwn", "unpolarized")
-            results = func.compute({"rho": rho})
-            V_C = results["zk"]
-            V_XC = (V_X + V_C).reshape(self.pw.grids)
-        else:
-            V_XC = self.V_XC
-
-        dvol = self.pw.model.volume / self.pw.num_grids
-        E = (V_XC * self.pw.rho_r).sum() * dvol
-        return E
-
-    def get_E_Hartree(self):
-        dvol = self.pw.model.volume / self.pw.num_grids
-        E = 0.5 * (self.V_Hartree * self.pw.rho_r).sum() * dvol
-        return E
-
-    def get_E_ps_nloc(self):
-        return self.psp.get_E_nloc(self.pw)
- 
-    def get_E_ps_loc(self):
-        return self.psp.get_E_loc(self.pw)
- 
-    def get_E_nn(self):
-        """
-        Ewald summation of the nuclear-nuclear energy
-        """
-        pass
-
-
+        self.eigvals = eigvals * 2
+        if self.converged:
+            print(self)
 
 if __name__ == "__main__":
 
@@ -818,9 +839,8 @@ if __name__ == "__main__":
 
     # Hamiltonian
     ham = Hamiltionian(pw, psp)
-    #ham.get_H_op()
-    #ham.get_E_total()
-    #print(ham)
+    ham.get_H_op()
+    ham.get_E_total()
+    print(ham)
+    
     ham.scf(200, beta=0.6, de_tol=1e-8)
-
-    # Todo: check the Kpoints
