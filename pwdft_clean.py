@@ -6,7 +6,6 @@ import numpy as np
 from scipy.special import erf, sph_harm
 from scipy import linalg
 from scipy.fft import fftn, ifftn
-import pylibxc
 
 class Structure:
 
@@ -141,23 +140,6 @@ class PlaneWaveBasis:
         psi_sqrt = linalg.sqrtm(np.conj(psi) @ psi.T)
         return linalg.inv(psi_sqrt).T @ psi
 
-    #def orthonormalize(self, psi):
-    #    """
-    #    Make the wavefunction orthonormal using NumPy only.
-    #    S = psi^+ psi =>  psi => S^(-1/2) psi
-    #    """
-    #    # Compute overlap matrix S = psi^H psi
-    #    S = np.conj(psi) @ psi.T
-    #
-    #    # Eigenvalue decomposition: S = U Λ U^T
-    #    eigvals, eigvecs = np.linalg.eigh(S)
-    #    eigvals = np.maximum(eigvals, 1e-12) 
-    #    # Compute S^(-1/2) = U Λ^(-1/2) U^T
-    #    S_inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
-    #
-    #    # Apply S^(-1/2) to orthonormalize psi
-    #    return S_inv_sqrt @ psi
-
     def random_guess(self):
         """
         Random wavefunction from the number of occupied states
@@ -245,11 +227,11 @@ class PspHgh:
         self.Z = Z
         self.rloc = rloc
         if len(cloc) < 4:
-            self.cloc = np.pad(cloc, (0, 4 - len(cloc)), 'constant')
+            self.cloc = np.pad(cloc, (0, 4 - len(cloc)), "constant")
         else:
             self.cloc = cloc
         self.lmax = len(h) - 1
-        self.proj = ['s', 'p', 'd', 'f'][:len(h)]
+        self.proj = ["s", "p", "d", "f"][:len(h)]
         self.rp = rp
         self.h = h
         self.ilm_indices = [(1, 0, 0),
@@ -514,6 +496,7 @@ class Hamiltionian:
         self.V_ps_loc = psp.v_loc_r
         self.V_Hartree = np.zeros(pw.grids)
         self.V_XC = np.zeros(pw.grids)
+        self.eps_XC = np.zeros(pw.grids)
         self.V_total = None #np.zeros(pw.grids)
 
         # energies
@@ -571,8 +554,9 @@ class Hamiltionian:
 
         # No update local potential in diag
         if self.V_total is None:
-            V_XC = self.get_V_XC()
+            V_XC, eps_XC = self.get_V_XC()
             V_H = self.get_V_Hartree()
+            self.eps_XC = eps_XC
             self.V_XC = V_XC
             self.V_Hartree = V_H
             self.V_total = self.V_ps_loc.real + V_XC + V_H
@@ -606,18 +590,65 @@ class Hamiltionian:
         T = 0.5 * (g2s * psi_1d)
         return T
 
-    def get_V_XC(self):
+    def get_V_XC(self, backend=None):
         """
-        Get V_XC from libxc from pylibxc
+        Get V_XC (Exchange-Correlation potential) in 3D real space using LDA.
+        Uses the Perdew-Zunger (PZ81) parametrization for correlation.
         """
         rho = self.pw.rho_r
-        func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
-        results = func.compute({"rho": rho})  
-        V_X = results["vrho"]  #["zk"]
-        func = pylibxc.LibXCFunctional("lda_c_vwn", "unpolarized")
-        results = func.compute({"rho": rho})
-        V_C = results["vrho"] #["zk"]
-        return (V_X + V_C).reshape(self.pw.grids)
+
+        if backend is not None:     # Call pylibxc
+            import pylibxc
+
+            func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
+            results = func.compute({"rho": rho})  
+            V_X, eps_X = results["vrho"], results["zk"]
+            func = pylibxc.LibXCFunctional("lda_c_pz", "unpolarized")
+            results = func.compute({"rho": rho})
+            V_C, eps_C = results["vrho"], results["zk"]
+
+        else:                       # from own code
+            # Exchange 
+            eps_X = -0.75 * (3.0 * rho / np.pi) ** (1 / 3)
+            V_X = (4 / 3) * eps_X
+    
+            # Correlation Potential (V_C) using PZ81
+            # Compute Wigner-Seitz radius (rs)
+            rs = (3 / (4 * np.pi * rho)) ** (1 / 3)
+            rs = np.minimum(rs, 1e6)  # Avoid excessively large values
+
+            # PZ81 Parameters
+            Ah, Bh, Ch, Dh = 0.0311, -0.048, 0.002, -0.0116  
+            g, b1, b2 = -0.1423, 1.0529, 0.3334
+    
+            # Correlation energy per particle, eps_C(rs)
+            eps_C = np.zeros_like(rs)
+            V_C = np.zeros_like(rs)
+    
+            # High-density region (rs < 1)
+            mask_h = rs < 1
+            rh = rs[mask_h]
+            logh = np.log(rh)
+            eps_C[mask_h] = Ah * logh + Bh + Ch * rh * logh + Dh * rh
+            V_C[mask_h] = Ah * logh + (Bh - Ah / 3.) + \
+                            2./3. * Ch * rh * logh + \
+                            (2. * Dh - Ch) / 3. * rh
+
+            # Low-density region (rs >= 1)
+            mask_l = ~mask_h
+            rl = rs[mask_l]
+    
+            # Corrected formula for correlation energy and potential
+            rs = np.sqrt(rl)
+            ox = 1. + b1 * rs + b2 * rl
+            dox = 1. + 7./.6 * b1 * rs + 4./3. * b2 * rl
+            eps_C[mask_l] = g / ox
+            V_C[mask_l] = eps_C[mask_l] * dox / ox
+
+        V_XC = (V_X + V_C).reshape(self.pw.grids)
+        eps_XC = (eps_X + eps_C).reshape(self.pw.grids)
+
+        return V_XC, eps_XC
 
     def get_V_Hartree(self):
         """
@@ -656,18 +687,8 @@ class Hamiltionian:
         """
         Compute the exchange-correlation energy from pylibxc
         """
-        rho = self.pw.rho_r
-        func = pylibxc.LibXCFunctional("lda_x", "unpolarized")
-        results = func.compute({"rho": rho})  
-        V_X = results["zk"]
-        
-        func = pylibxc.LibXCFunctional("lda_c_vwn", "unpolarized")
-        results = func.compute({"rho": rho})
-        V_C = results["zk"]
-        
-        V_XC = (V_X + V_C).reshape(self.pw.grids)
         dvol = self.pw.model.volume / self.pw.num_grids
-        E = (V_XC * self.pw.rho_r).sum() * dvol
+        E = (self.eps_XC * self.pw.rho_r).sum() * dvol
         return E
 
     def get_E_Hartree(self):
@@ -799,8 +820,9 @@ class Hamiltionian:
             self.pw.rho_r = rho
 
             # Update H
-            V_XC = self.get_V_XC()
+            V_XC, eps_XC = self.get_V_XC()
             V_H = self.get_V_Hartree()
+            self.eps_XC = eps_XC
             self.V_XC = V_XC
             self.V_Hartree = V_H
             self.V_total = self.V_ps_loc.real + V_XC + V_H
@@ -860,6 +882,17 @@ if __name__ == "__main__":
 
     # Hamiltonian
     ham = Hamiltionian(pw, psp)
+
+    V, eps = ham.get_V_XC()
+    ham.V_XC, ham.eps_XC = V, eps
+    E1 = ham.get_E_XC()
+
+    V, eps = ham.get_V_XC(backend="pylibxc")
+    ham.V_XC, ham.eps_XC = V, eps
+    E2 = ham.get_E_XC()
+    print(f"E_XC_from_owncode: {E1:.6f}")
+    print(f"E_XC_from_pylibxc: {E2:.6f}")
+
     ham.get_H_op()
     ham.get_E_total()
     print(ham)
